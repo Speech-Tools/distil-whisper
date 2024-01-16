@@ -2,8 +2,8 @@
 wav와 txt로 이루어진 원본 데이터셋을
 huggingface dataset 객체로 구성해 distil-whisper에 사용할 수 있게 만드는 코드
 
-입력으로 받는 `db_dir` 안에는 기본적으로 훈련용 데이터셋 디렉터리인 train_data_01과
-테스트용 데이터셋 디렉터리인 test_data_01이 존재해야 한다.
+입력으로 받는 `db_dir` 안에는 기본적으로 훈련용 데이터셋 디렉터리인 train과
+테스트용 데이터셋 디렉터리인 test가 존재해야 한다.
 
 Usage:
     python data_prep.py \
@@ -21,12 +21,12 @@ import argparse
 import subprocess
 import numpy as np
 import librosa
-import csv
 import pyarrow as pa
+from glob import glob
 from datasets import Dataset
 from pathlib import Path
-from typing import Union, List, Tuple
-from multiprocessing import Pool
+from typing import Union, List, Tuple, Iterable
+from multiprocessing import Process
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -47,7 +47,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--nj",
         type=int,
-        default=16,
+        default=64,
         help="A number of multiprocess.",
     )
     return parser
@@ -94,11 +94,35 @@ def process_one(txt_file: Tuple[int, Path]):
     return result
 
 
-def work(txt_files: List[Tuple[int, Path]]):
+def work(txt_files: List[Tuple[int, Path]], dst_dir):
+    process_id = txt_files[0][0]
     outputs = list(map(process_one, txt_files))
     outputs = [output for output in outputs if output['path'] != None]
-    print(f"Done multiprocess id: {txt_files[0][0]}")
-    return outputs
+        
+    # 저장
+    paths = []
+    wavs = []
+    texts = []
+    for temp_data in outputs:
+        paths.append(temp_data['path'])
+        wavs.append(temp_data['audio'])
+        texts.append(temp_data['sentence'])
+
+    final_result = {
+        'path': paths,
+        'audio': wavs,
+        'sentence': texts,
+    }
+    
+    final_dataset = Dataset.from_dict(final_result)
+    save_dataset_dir = dst_dir / process_id
+    save_dataset_dir.mkdir(parents=True ,exist_ok=True)
+    final_dataset.save_to_disk(save_dataset_dir)
+    print(f"Save dataset to {save_dataset_dir}")
+
+
+def get_files(target_dir: Path, pattern: str) -> Iterable[Path]:
+    return (Path(file) for file in glob(str(target_dir / '**' / pattern), recursive=True))
 
 
 def prepare_data(
@@ -116,49 +140,38 @@ def prepare_data(
         dst_dir.mkdir(parents=True, exist_ok=True)
 
     if not src_dir.is_dir():
-        raise FileNotFoundError(f"No such directorry: {src_dir}")
+        raise FileNotFoundError(f"No such directory: {src_dir}")
 
     # Prepare `text`
     ## '.txt' 파일 탐색
     ## utt id는 순서대로 임의로 붙이기
     print(f"Start find txt files in {src_dir}")
 
-    target_txts = list(enumerate(sorted(src_dir.rglob('*.txt'))))
-    print(f"Length of dataset: {len(target_txts)}")
+    target_txts = list(enumerate(sorted(get_files(src_dir, '*.txt'))))
     target_txts = [(str(target_txt[0]).zfill(10), target_txt[1]) for target_txt in target_txts]
+    
     div = math.ceil(len(target_txts) / nj)
     div_target_txts = [target_txts[i*div:(i+1)*div] for i in range((len(target_txts)+div-1) // div)]
 
-    with Pool(nj) as p:
-        results = p.map(work, div_target_txts)
+    # For multiprocess
+    tmp = []
+    for div_target_txt in div_target_txts:
+        tmp.append(Process(target=work, args=(div_target_txt, dst_dir)))
 
-    # Parsing 후 저장
-    paths = []
-    wavs = []
-    texts = []
-    for result in results:
-        for temp_data in result:
-            paths.append(temp_data['path'])
-            wavs.append(temp_data['audio'])
-            texts.append(temp_data['sentence'])
+    for t in tmp:
+        print("Process Start")
+        t.start()
 
-    final_result = {
-        'path': paths,
-        'audio': wavs,
-        'sentence': texts,
-    }
-    
-    final_dataset = Dataset.from_dict(final_result)
-    final_dataset.save_to_disk(dst_dir)
-    print(f"Save dataset to {dst_dir}")
+    for t in tmp:
+        t.join()
 
 
 def main():
     parser = get_parser()
     args = parser.parse_args()
 
-    # data_parts = ["test_data_01", "train_data_01"]
-    data_parts = ["train_data_01"]
+    data_parts = ["test", "train"]
+    # data_parts = ["train_data_01"]
     for data_part in data_parts:
         print(f"Preparing {args.db_dir / data_part}")
         prepare_data(args.db_dir / data_part / "고객응대", args.out_dir / data_part, nj=args.nj)
