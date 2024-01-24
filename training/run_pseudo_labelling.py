@@ -147,6 +147,18 @@ class DataTrainingArguments:
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
 
+    dataset_local_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "The path of the dataset in local direcotry."},
+    )
+    dataset_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "The extension of dataset files. If you use local datasets, must specify this argument."},
+    )
+    split_train_to_valid: Optional[float] = field(
+        default=None,
+        metadata={"help": "If given, automatically split train set to validation set according to this value. If there is existing validation set, it do not split dataset."}
+    )
     dataset_name: str = field(
         default=None,
         metadata={"help": "The name of the dataset to use (via the datasets library)."},
@@ -433,7 +445,7 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    # Log a small summary on each proces
+    # Log a small summary on each process
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
         f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
@@ -453,26 +465,75 @@ def main():
     token = model_args.token if model_args.token is not None else HfFolder().get_token()
 
     data_splits = data_args.dataset_split_name.split("+")
+
+    # dataset_local_path 인자가 None이 아닌 경우 로컬 디렉터리에서 가져오도록 만들기
+    # TODO: TEST
     for split in data_splits:
-        if data_args.streaming:
-            raw_datasets[split] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=split,
-                cache_dir=data_args.dataset_cache_dir,
-                token=token,
-                streaming=True,
-            )
+        if data_args.dataset_local_path:
+            # 로컬 디렉터리를 사용하는 경우
+            if not data_args.dataset_type:
+                # dataset type이 명시되지 않은 경우 오류 발생
+                raise ValueError(
+                    f"Make sure to set `--dataset_type` to the correct extension of dataset file",
+                    f"e.g.: --dataset_type arrow"
+                )
+
+            # Target data_files 찾기
+            target_data_files = os.path.join(data_args.dataset_local_path, split, f'**/*.{data_args.dataset_type}')
+            if data_args.streaming:
+                raw_datasets[split] = load_dataset(
+                    data_args.dataset_type,
+                    data_files=target_data_files,
+                    split='train', # 로컬 데이터셋에서는 train, test가 구분이 없을 수 있기에 train으로 설정, 어차피 결과와는 무관하며 기본이 'train'이기에 'train'으로 설정
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=token,
+                    streaming=True,
+                )
+            else:
+                raw_datasets[split] = load_dataset(
+                    data_args.dataset_type,
+                    data_files=target_data_files,
+                    split='train',
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=token,
+                    streaming=False,
+                    num_proc=data_args.preprocessing_num_workers,
+                )
+        
         else:
-            raw_datasets[split] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=split,
-                cache_dir=data_args.dataset_cache_dir,
-                token=token,
-                streaming=False,
-                num_proc=data_args.preprocessing_num_workers,
-            )
+            # HuggingFace Hub에서 다운로드하는 경우
+            if data_args.streaming:
+                raw_datasets[split] = load_dataset(
+                    data_args.dataset_name,
+                    data_args.dataset_config_name,
+                    split=split,
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=token,
+                    streaming=True,
+                )
+            else:
+                raw_datasets[split] = load_dataset(
+                    data_args.dataset_name,
+                    data_args.dataset_config_name,
+                    split=split,
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=token,
+                    streaming=False,
+                    num_proc=data_args.preprocessing_num_workers,
+                )
+                
+    # train, test만 있는 경우 추가 옵션을 통해 train으로부터 validation 생성
+    # TODO: TEST, streaming 시 
+
+    if not data_args.streaming and data_args.split_train_to_valid and 'validation' not in data_splits:
+        train_valid_dataset = raw_datasets['train'].train_test_split(test_size=data_args.split_train_to_valid)
+
+        raw_datasets = DatasetDict({
+            'train': train_valid_dataset['train'],
+            'validation': train_valid_dataset['test'],
+            'test': raw_datasets['test'],
+        })
+        data_splits.append('validation')
 
     if data_args.audio_column_name not in next(iter(raw_datasets.values())).column_names:
         raise ValueError(
