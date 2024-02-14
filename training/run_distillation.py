@@ -206,6 +206,10 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing if using non-streaming mode."},
     )
+    preprocessing_batch_size: Optional[int] = field(
+        default=256,
+        metadata={"help": "Number of examples per batch provided to the `prepare_dataset` function."},
+    )
     max_train_samples: Optional[int] = field(
         default=None,
         metadata={
@@ -437,6 +441,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         # replace initial prompt tokens with -100 to ignore correctly when computing the loss
         bos_index = torch.argmax((labels == self.decoder_start_token_id).long(), dim=1)
+        bos_index = torch.where(bos_index > 0, bos_index + 1, bos_index)
         prompt_mask = torch.arange(labels.shape[1]) < bos_index[:, None]
         labels = torch.where(prompt_mask, -100, labels)
 
@@ -1310,9 +1315,7 @@ def main():
             function=prepare_train_dataset,
             remove_columns=raw_datasets_train_features,
             batched=True,
-            batch_size=max(
-                training_args.per_device_train_batch_size // 4, 4
-            ),  # TODO(SG) make data prep bs configurable
+            batch_size=data_args.preprocessing_batch_size,
         )
         vectorized_datasets["train"] = (
             map_fn_train(num_proc=num_workers, desc="preprocess train dataset")
@@ -1687,8 +1690,11 @@ def main():
                         rotate_checkpoints(training_args.save_total_limit, output_dir=training_args.output_dir)
 
                         if cur_step == total_train_steps:
+                            # un-wrap student model for save
                             student_model = accelerator.unwrap_model(student_model)
                             student_model.save_pretrained(training_args.output_dir)
+                            # re-wrap student model for final eval
+                            student_model = accelerator.prepare(student_model)
 
                         if training_args.push_to_hub:
                             repo.push_to_hub(
