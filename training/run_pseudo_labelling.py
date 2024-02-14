@@ -730,8 +730,9 @@ def main():
         wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
 
         # normalize everything and re-compute the WER
-        norm_pred_str = [normalizer(pred) for pred in pred_str]
-        norm_label_str = [normalizer(label) for label in label_str]
+        # TODO: normalize 후 strip 필요
+        norm_pred_str = [normalizer(pred).strip() for pred in pred_str]
+        norm_label_str = [normalizer(label).strip() for label in label_str]
         # for logging, we need the pred/labels to match the norm_pred/norm_labels, so discard any filtered samples here
         pred_str = [pred_str[i] for i in range(len(norm_pred_str)) if len(norm_label_str[i]) > 0]
         label_str = [label_str[i] for i in range(len(norm_label_str)) if len(norm_label_str[i]) > 0]

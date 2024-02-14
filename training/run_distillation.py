@@ -1181,6 +1181,7 @@ def main():
                 wer = 100 * metric.compute(predictions=[norm_whisper_transcript], references=[norm_ground_truth])
             except ValueError as e:
                 # TODO: ground truth에 정답이 포함되어있지 않은 경우가 있음
+                # 일단 원본 정답으로 계산하도록 변경 -> 어차피 False가됨
                 print(e)
                 print(f"Norm whisper transcript: {norm_whisper_transcript}")
                 print(f"Norm ground truth: {norm_ground_truth}")
