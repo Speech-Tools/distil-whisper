@@ -613,13 +613,24 @@ def load_multiple_datasets(
         # TODO: Local dataset 불러오기 위한 코드 리팩토링
         # TODO: load한 데이터셋이 features를 unknown으로 표시하는 오류 해결
         if dataset_local_path is not None and dataset_type is not None:
-            dataset = load_dataset(
-                dataset_type,
-                data_files=dataset_local_path,
-                split=dataset_dict["split"],
-                streaming=streaming,
-                **kwargs,
-            )
+            # TODO: Local arrow dataset을 로딩할 때 streaming이 아닌 경우
+            if not streaming and dataset_type=='arrow':
+                target_data_files = os.path.join(dataset_local_path, f'**/*.{dataset_type}')
+                dataset = load_dataset(
+                    dataset_type,
+                    data_files=target_data_files,
+                    split=dataset_dict["split"],
+                    streaming=streaming,
+                    **kwargs,
+                )
+            else:
+                dataset = load_dataset(
+                    dataset_type,
+                    data_files=dataset_local_path,
+                    split=dataset_dict["split"],
+                    streaming=streaming,
+                    **kwargs,
+                )
             
         else:
             dataset = load_dataset(
@@ -897,6 +908,7 @@ def main():
     set_seed(training_args.seed)
 
     if training_args.do_train:
+        # TODO: 일단 제거, 괜히 복잡해짐, 데이터셋을 로딩하는 코드를 심플하게 변경하기
         raw_datasets["train"] = load_multiple_datasets(
             data_args.train_dataset_name,
             data_args.train_dataset_config_name,
@@ -930,14 +942,25 @@ def main():
             all_eval_splits.append("eval")
             # TODO: Load Local dataset code refactoring
             if data_args.eval_dataset_local_path is not None and data_args.eval_dataset_type is not None:
-                raw_datasets["eval"] = load_dataset(
-                    data_args.eval_dataset_type,
-                    data_files=data_args.eval_dataset_local_path,
-                    split=dataset_dict["split"],
-                    cache_dir=data_args.dataset_cache_dir,
-                    token=model_args.token,
-                    streaming=data_args.streaming,
-                )
+                if not data_args.streaming and data_args.eval_dataset_type=="arrow":
+                    target_data_files = os.path.join(data_args.eval_dataset_local_path, f'**/*.{data_args.eval_dataset_type}')
+                    raw_datasets["eval"] = load_dataset(
+                        data_args.eval_dataset_type,
+                        data_files=target_data_files,
+                        split=dataset_dict["split"],
+                        cache_dir=data_args.dataset_cache_dir,
+                        token=model_args.token,
+                        streaming=data_args.streaming,
+                    )
+                else:
+                    raw_datasets["eval"] = load_dataset(
+                        data_args.eval_dataset_type,
+                        data_files=data_args.eval_dataset_local_path,
+                        split=dataset_dict["split"],
+                        cache_dir=data_args.dataset_cache_dir,
+                        token=model_args.token,
+                        streaming=data_args.streaming,
+                    )
                 if data_args.streaming:
                     # 불러온 데이터셋이 의사 라벨링 데이터셋만 포함하는 경우 수행하기
                     def map_find_original_data(samples):
@@ -1330,7 +1353,7 @@ def main():
             map_fn_eval = partial(
                 raw_datasets[eval_split].map, function=prepare_eval_dataset, remove_columns=raw_datasets_eval_features
             )
-            
+            # TODO: 아래 조건문 아예 없애기
             if accelerator.is_main_process:
                 vectorized_datasets[eval_split] = (
                     map_fn_eval(num_proc=num_workers, desc="preprocess eval dataset")
@@ -1393,8 +1416,9 @@ def main():
         wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
 
         # normalize everything and re-compute the WER
-        norm_pred_str = [normalizer(pred) for pred in pred_str]
-        norm_label_str = [normalizer(label) for label in label_str]
+        # normalize 후 strip
+        norm_pred_str = [normalizer(pred).strip() for pred in pred_str]
+        norm_label_str = [normalizer(label).strip() for label in label_str]
         # for logging, we need the pred/labels to match the norm_pred/norm_labels, so discard any filtered samples here
         pred_str = [pred_str[i] for i in range(len(norm_pred_str)) if len(norm_label_str[i]) > 0]
         label_str = [label_str[i] for i in range(len(norm_label_str)) if len(norm_label_str[i]) > 0]
@@ -1707,16 +1731,10 @@ def main():
                     student_model.eval()
                     # ======================== Evaluating ==============================
                     for eval_split in all_eval_splits:
-                        if not accelerator.is_local_main_process:
-                            # 메인 프로세스가 아닌 경우 eval dataset이 없기 때문에
-                            # 이후에 Key Error가 발생함
-                            # 따라서 메인 프로세스가 아닌 경우 break하도록 설정
-                            break
                         eval_metrics = []
                         eval_preds = []
                         eval_labels = []
                         eval_start = time.time()
-                        
                         validation_dataloader = DataLoader(
                             vectorized_datasets[eval_split],
                             collate_fn=data_collator,
