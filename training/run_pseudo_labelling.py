@@ -460,7 +460,7 @@ def main():
         transformers.utils.logging.set_verbosity_error()
     logger.info("Training/evaluation parameters %s", training_args)
 
-    # 3. Load dataset
+    # 4. Load dataset
     raw_datasets = IterableDatasetDict() if data_args.streaming else DatasetDict()
     token = model_args.token if model_args.token is not None else HfFolder().get_token()
 
@@ -469,6 +469,7 @@ def main():
     # dataset_local_path 인자가 None이 아닌 경우 로컬 디렉터리에서 가져오도록 만들기
     # TODO: TEST
     for split in data_splits:
+        logger.info(f"Loading raw datasets split: {split}")
         if data_args.dataset_local_path:
             # 로컬 디렉터리를 사용하는 경우
             if not data_args.dataset_type:
@@ -479,6 +480,7 @@ def main():
                 )
 
             # Target data_files 찾기
+            logger.info(f"Finding local target data files: {data_args.dataset_local_path}")
             target_data_files = os.path.join(data_args.dataset_local_path, split, f'**/*.{data_args.dataset_type}')
             if data_args.streaming:
                 raw_datasets[split] = load_dataset(
@@ -524,7 +526,6 @@ def main():
                 
     # train, test만 있는 경우 추가 옵션을 통해 train으로부터 validation 생성
     # TODO: TEST, streaming 시 
-
     if not data_args.streaming and data_args.split_train_to_valid and 'validation' not in data_splits:
         train_valid_dataset = raw_datasets['train'].train_test_split(test_size=data_args.split_train_to_valid)
 
@@ -551,19 +552,22 @@ def main():
             f" {', '.join(next(iter(raw_datasets.values())).column_names)}."
         )
 
-    # 7. Load pretrained model, tokenizer, and feature extractor
+    # 5. Load pretrained model, tokenizer, and feature extractor
+    logger.info(f"Loading pretrained whisper config")
     config = WhisperConfig.from_pretrained(
         (model_args.config_name if model_args.config_name else model_args.model_name_or_path),
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=token,
     )
+    logger.info(f"Loading pretrained whisper feature extractor")
     feature_extractor = WhisperFeatureExtractor.from_pretrained(
         (model_args.feature_extractor_name if model_args.feature_extractor_name else model_args.model_name_or_path),
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=token,
     )
+    logger.info(f"Loading pretrained whisper tokenizer")
     tokenizer = WhisperTokenizerFast.from_pretrained(
         (model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path),
         cache_dir=model_args.cache_dir,
@@ -571,12 +575,14 @@ def main():
         revision=model_args.model_revision,
         token=token,
     )
+    logger.info(f"Loading pretrained whisper processor")
     processor = WhisperProcessor.from_pretrained(
         (model_args.processor_name if model_args.processor_name else model_args.model_name_or_path),
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=token,
     )
+    logger.info(f"Loading pretrained whisper model")
     model = WhisperForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path,
         config=config,
@@ -599,6 +605,7 @@ def main():
             "3. `flash_attn_2`: Flash Attention 2 through the Flash Attention package https://github.com/Dao-AILab/flash-attention. **Always** recommended on supported hardware (Ampere, Ada, or Hopper GPUs, e.g., A100, RTX 3090, RTX 4090, H100)."
         )
 
+    logger.info(f"Turn model to eval mode")
     model.eval()
 
     if model.config.decoder_start_token_id is None:
@@ -618,6 +625,7 @@ def main():
 
     # 6. Resample speech dataset: `datasets` takes care of automatically loading and resampling the audio,
     # so we just need to set the correct target sampling rate.
+    logger.info(f"Resample Speech datasets")
     raw_datasets = raw_datasets.cast_column(
         data_args.audio_column_name,
         datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate),
@@ -625,6 +633,7 @@ def main():
 
     # 7. Preprocessing the datasets.
     # We need to read the audio files as arrays and tokenize the targets.
+    logger.info(f"Preprocessing the datasets")
     max_label_length = (
         data_args.max_label_length if data_args.max_label_length is not None else model.config.max_length
     )
@@ -717,6 +726,7 @@ def main():
             os.makedirs(output_dir)
 
     # 8. Load Metric
+    logger.info(f"Load metric")
     metric = evaluate.load("wer")
 
     def compute_metrics(preds, labels, file_ids):
@@ -730,7 +740,7 @@ def main():
         wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
 
         # normalize everything and re-compute the WER
-        # TODO: normalize 후 strip 필요
+        # normalize 후 strip
         norm_pred_str = [normalizer(pred).strip() for pred in pred_str]
         norm_label_str = [normalizer(label).strip() for label in label_str]
         # for logging, we need the pred/labels to match the norm_pred/norm_labels, so discard any filtered samples here
@@ -745,7 +755,8 @@ def main():
 
         return {"wer": wer, "wer_ortho": wer_ortho}, pred_str, label_str, norm_pred_str, norm_label_str, file_ids
 
-    # 12. Define Training Schedule
+    # 9. Define Training Schedule
+    logger.info(f"Define Training Schedule")
     per_device_eval_batch_size = int(training_args.per_device_eval_batch_size)
 
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
@@ -756,8 +767,9 @@ def main():
         max_target_length=max_label_length,
     )
 
-    # 14. Define generation arguments - we need to do this before we wrap the models in DDP
+    # 10. Define generation arguments - we need to do this before we wrap the models in DDP
     # so that we can still access the configs
+    logger.info(f"Define generation arguments")
     num_beams = (
         training_args.generation_num_beams
         if training_args.generation_num_beams is not None
@@ -778,7 +790,8 @@ def main():
             }
         )
 
-    # 15. Prepare everything with accelerate
+    # 11. Prepare everything with accelerate
+    logger.info(f"Prepare everything with accelerate")
     model = accelerator.prepare(model)
 
     def eval_step_with_save(split="eval"):
