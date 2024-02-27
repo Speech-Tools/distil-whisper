@@ -678,7 +678,7 @@ def load_multiple_datasets(
             })
             dataset = dataset.cast(result_ft)
             
-        dataset = dataset.cast_column("audio", Audio(sampling_rate))
+        # dataset = dataset.cast_column("audio", Audio(sampling_rate))
         dataset_features = dataset.features.keys()
         columns_to_keep = {"audio", "text"}
 
@@ -1193,7 +1193,7 @@ def main():
 
     # 10.3: filter training data based on WER threshold -> this is KEY to good distillation performance
     def is_wer_in_range(ground_truth, whisper_transcript):
-        norm_ground_truth = normalizer(ground_truth)
+        norm_ground_truth = normalizer(ground_truth).strip()
         if (
             isinstance(whisper_transcript, str)
             and whisper_transcript.startswith("[")
@@ -1204,7 +1204,7 @@ def main():
         if isinstance(whisper_transcript, list):
             whisper_transcript = tokenizer.decode(whisper_transcript, skip_special_tokens=True)
         if len(norm_ground_truth) > 0 and whisper_transcript is not None:
-            norm_whisper_transcript = normalizer(whisper_transcript)
+            norm_whisper_transcript = normalizer(whisper_transcript).strip()
             try:
                 wer = 100 * metric.compute(predictions=[norm_whisper_transcript], references=[norm_ground_truth])
             except ValueError as e:
@@ -1264,7 +1264,8 @@ def main():
             if isinstance(input_str, list):
                 # pseudo-labelled transcriptions have been retained as token ids (`decode_token_ids=False`)
                 token_ids = input_str
-            elif input_str[0].startswith("[") and input_str[0].endswith("]"):
+            # elif input_str[0].startswith("[") and input_str[0].endswith("]"): REPLACE
+            elif input_str.startswith("[") and input_str.endswith("]"):
                 token_ids = re.findall(r"\d+", input_str)
                 token_ids = [int(token) for token in token_ids]
             else:
