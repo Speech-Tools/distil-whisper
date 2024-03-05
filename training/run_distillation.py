@@ -1361,6 +1361,11 @@ def main():
                     if not data_args.streaming
                     else map_fn_eval()
                 )
+            # vectorized_datasets[eval_split] = (
+            #     map_fn_eval(num_proc=num_workers, desc="preprocess eval dataset")
+            #     if not data_args.streaming
+            #     else map_fn_eval()
+            # )
 
     # 10.5: Filter training data with inputs longer than `max_input_length`
     def is_audio_in_length_range(length):
