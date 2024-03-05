@@ -1,0 +1,10 @@
+.ipynb_checkpoints/
+*ipynb
+
+wandb
+
+*.sh
+*.log
+
+data
+speechDATA

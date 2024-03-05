@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import time
+import librosa
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -41,6 +42,9 @@ from datasets import (
     DatasetDict,
     IterableDataset,
     IterableDatasetDict,
+    Features,
+    Audio,
+    Value,
     concatenate_datasets,
     interleave_datasets,
     load_dataset,
@@ -134,6 +138,14 @@ class DataTrainingArguments:
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
 
+    train_dataset_local_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "The path of the dataset file in local direcotry."},
+    )
+    train_dataset_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "The extension of dataset files. If you use local datasets, must specify this argument."},
+    )
     train_dataset_name: str = field(
         default=None,
         metadata={
@@ -158,6 +170,14 @@ class DataTrainingArguments:
             "probability for each dataset. Setting them equal to the number of sample values ensures that every "
             "sample from every dataset is used once per epoch."
         },
+    )
+    eval_dataset_local_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "The path of the dataset file in local direcotry."},
+    )
+    eval_dataset_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "The extension of dataset files. If you use local datasets, must specify this argument."},
     )
     eval_dataset_name: str = field(
         default=None,
@@ -560,6 +580,8 @@ def convert_dataset_str_to_list(
 def load_multiple_datasets(
     dataset_names: Union[List, str],
     dataset_config_names: Union[List, str],
+    dataset_local_path: Optional[str] = None,
+    dataset_type: Optional[str] = None,
     splits: Optional[Union[List, str]] = None,
     text_column_names: Optional[List] = None,
     sampling_rate: Optional[int] = 16000,
@@ -588,15 +610,75 @@ def load_multiple_datasets(
         desc="Combining datasets...",
         disable=not accelerator.is_local_main_process if accelerator is not None else False,
     ):
-        dataset = load_dataset(
-            dataset_dict["name"],
-            dataset_dict["config"],
-            split=dataset_dict["split"],
-            streaming=streaming,
-            **kwargs,
-        )
+        # TODO: Local dataset 불러오기 위한 코드 리팩토링
+        # TODO: load한 데이터셋이 features를 unknown으로 표시하는 오류 해결
+        if dataset_local_path is not None and dataset_type is not None:
+            # TODO: Local arrow dataset을 로딩할 때 streaming이 아닌 경우
+            if not streaming and dataset_type=='arrow':
+                target_data_files = os.path.join(dataset_local_path, f'**/*.{dataset_type}')
+                dataset = load_dataset(
+                    dataset_type,
+                    data_files=target_data_files,
+                    split=dataset_dict["split"],
+                    streaming=streaming,
+                    **kwargs,
+                )
+            else:
+                dataset = load_dataset(
+                    dataset_type,
+                    data_files=dataset_local_path,
+                    split=dataset_dict["split"],
+                    streaming=streaming,
+                    **kwargs,
+                )
+            
+        else:
+            dataset = load_dataset(
+                dataset_dict["name"],
+                dataset_dict["config"],
+                split=dataset_dict["split"],
+                streaming=streaming,
+                **kwargs,
+            )
         # resample to specified sampling rate
-        dataset = dataset.cast_column("audio", datasets.features.Audio(sampling_rate))
+        # TODO: streaming 모드를 위한 처리
+        # psuedo labelling 시 streaming=False로 했으면 이 과정 필요없음
+        if streaming:
+            # 불러온 데이터셋이 의사 라벨링 데이터셋만 포함하는 경우 수행하기
+            def map_find_original_data(samples):
+                audio_datas = []
+                txt_datas = []
+                for sample_id in samples['file_id']:
+                    wav_file = sample_id
+                    txt_file = wav_file.replace('source', 'label')
+                    txt_file = Path(txt_file).with_suffix('.txt')
+                    
+                    with open(txt_file, 'r') as f:
+                        utt = f.read().strip()
+                        utt = utt.replace('\n', ' ')
+                    
+                    wav_data, sr = librosa.load(wav_file, sr=16000)
+                    wav_dict = {
+                        'path': wav_file,
+                        'array': wav_data,
+                        'sampling_rate': sr
+                    }
+                    audio_datas.append(wav_dict)
+                    txt_datas.append(utt)
+                samples['audio'] = audio_datas
+                samples['sentence'] = txt_datas
+                return samples
+            
+            dataset = dataset.map(map_find_original_data, batched=True)
+            result_ft = Features({
+                'file_id': Value('string'),
+                'whisper_transcript': Value('string'),
+                'audio': Audio(sampling_rate=16000), # Audio 형식에 맞게 만들기
+                'sentence': Value('string'),
+            })
+            dataset = dataset.cast(result_ft)
+            
+        # dataset = dataset.cast_column("audio", Audio(sampling_rate))
         dataset_features = dataset.features.keys()
         columns_to_keep = {"audio", "text"}
 
@@ -826,9 +908,12 @@ def main():
     set_seed(training_args.seed)
 
     if training_args.do_train:
+        # TODO: 일단 제거, 괜히 복잡해짐, 데이터셋을 로딩하는 코드를 심플하게 변경하기
         raw_datasets["train"] = load_multiple_datasets(
             data_args.train_dataset_name,
             data_args.train_dataset_config_name,
+            dataset_local_path=data_args.train_dataset_local_path,
+            dataset_type=data_args.train_dataset_type,
             splits=data_args.train_split_name,
             text_column_names=data_args.text_column_name,
             use_pseudo_labels=data_args.use_pseudo_labels,
@@ -855,14 +940,71 @@ def main():
             # load a single eval set
             dataset_dict = dataset_names_dict[0]
             all_eval_splits.append("eval")
-            raw_datasets["eval"] = load_dataset(
-                dataset_dict["name"],
-                dataset_dict["config"],
-                split=dataset_dict["split"],
-                cache_dir=data_args.dataset_cache_dir,
-                token=model_args.token,
-                streaming=data_args.streaming,
-            )
+            # TODO: Load Local dataset code refactoring
+            if data_args.eval_dataset_local_path is not None and data_args.eval_dataset_type is not None:
+                if not data_args.streaming and data_args.eval_dataset_type=="arrow":
+                    target_data_files = os.path.join(data_args.eval_dataset_local_path, f'**/*.{data_args.eval_dataset_type}')
+                    raw_datasets["eval"] = load_dataset(
+                        data_args.eval_dataset_type,
+                        data_files=target_data_files,
+                        split=dataset_dict["split"],
+                        cache_dir=data_args.dataset_cache_dir,
+                        token=model_args.token,
+                        streaming=data_args.streaming,
+                    )
+                else:
+                    raw_datasets["eval"] = load_dataset(
+                        data_args.eval_dataset_type,
+                        data_files=data_args.eval_dataset_local_path,
+                        split=dataset_dict["split"],
+                        cache_dir=data_args.dataset_cache_dir,
+                        token=model_args.token,
+                        streaming=data_args.streaming,
+                    )
+                if data_args.streaming:
+                    # 불러온 데이터셋이 의사 라벨링 데이터셋만 포함하는 경우 수행하기
+                    def map_find_original_data(samples):
+                        audio_datas = []
+                        txt_datas = []
+                        for sample_id in samples['file_id']:
+                            wav_file = sample_id
+                            txt_file = wav_file.replace('source', 'label')
+                            txt_file = Path(txt_file).with_suffix('.txt')
+                            
+                            with open(txt_file, 'r') as f:
+                                utt = f.read().strip()
+                                utt = utt.replace('\n', ' ')
+                            
+                            wav_data, sr = librosa.load(wav_file, sr=16000)
+                            wav_dict = {
+                                'path': wav_file,
+                                'array': wav_data,
+                                'sampling_rate': sr
+                            }
+                            audio_datas.append(wav_dict)
+                            txt_datas.append(utt)
+                        samples['audio'] = audio_datas
+                        samples['sentence'] = txt_datas
+                        return samples
+                    
+                    raw_datasets['eval'] = raw_datasets['eval'].map(map_find_original_data, batched=True)
+                    result_ft = Features({
+                        'file_id': Value('string'),
+                        'whisper_transcript': Value('string'),
+                        'audio': Audio(sampling_rate=16000), # Audio 형식에 맞게 만들기
+                        'sentence': Value('string'),
+                    })
+                    raw_datasets['eval'] = raw_datasets['eval'].cast(result_ft)
+            
+            else:
+                raw_datasets["eval"] = load_dataset(
+                    dataset_dict["name"],
+                    dataset_dict["config"],
+                    split=dataset_dict["split"],
+                    cache_dir=data_args.dataset_cache_dir,
+                    token=model_args.token,
+                    streaming=data_args.streaming,
+                )
             if data_args.eval_text_column_name != "text":
                 raw_datasets["eval"] = raw_datasets["eval"].rename_column(data_args.eval_text_column_name, "text")
         else:
@@ -874,6 +1016,7 @@ def main():
                 else:
                     pretty_name = f"{dataset_dict['name'].split('/')[-1]}/{dataset_dict['split'].replace('.', '-')}"
                 all_eval_splits.append(pretty_name)
+                # TODO: 여러 로컬 데이터셋 불러오기 위한 코드 추가
                 raw_datasets[pretty_name] = load_dataset(
                     dataset_dict["name"],
                     dataset_dict["config"],
@@ -1050,7 +1193,7 @@ def main():
 
     # 10.3: filter training data based on WER threshold -> this is KEY to good distillation performance
     def is_wer_in_range(ground_truth, whisper_transcript):
-        norm_ground_truth = normalizer(ground_truth)
+        norm_ground_truth = normalizer(ground_truth).strip()
         if (
             isinstance(whisper_transcript, str)
             and whisper_transcript.startswith("[")
@@ -1061,8 +1204,17 @@ def main():
         if isinstance(whisper_transcript, list):
             whisper_transcript = tokenizer.decode(whisper_transcript, skip_special_tokens=True)
         if len(norm_ground_truth) > 0 and whisper_transcript is not None:
-            norm_whisper_transcript = normalizer(whisper_transcript)
-            wer = 100 * metric.compute(predictions=[norm_whisper_transcript], references=[norm_ground_truth])
+            norm_whisper_transcript = normalizer(whisper_transcript).strip()
+            try:
+                wer = 100 * metric.compute(predictions=[norm_whisper_transcript], references=[norm_ground_truth])
+            except ValueError as e:
+                # TODO: ground truth에 정답이 포함되어있지 않은 경우가 있음
+                # 일단 원본 정답으로 계산하도록 변경 -> 어차피 False가됨
+                print(e)
+                print(f"Norm whisper transcript: {norm_whisper_transcript}")
+                print(f"Norm ground truth: {norm_ground_truth}")
+                print(f"Ground truth: {ground_truth}")
+                wer = 100 * metric.compute(predictions=[norm_whisper_transcript], references=[ground_truth])
             return wer < wer_threshold
         else:
             # filter automatically since we can't know the WER
@@ -1112,7 +1264,8 @@ def main():
             if isinstance(input_str, list):
                 # pseudo-labelled transcriptions have been retained as token ids (`decode_token_ids=False`)
                 token_ids = input_str
-            elif input_str[0].startswith("[") and input_str[0].endswith("]"):
+            # elif input_str[0].startswith("[") and input_str[0].endswith("]"): REPLACE
+            elif input_str.startswith("[") and input_str.endswith("]"):
                 token_ids = re.findall(r"\d+", input_str)
                 token_ids = [int(token) for token in token_ids]
             else:
@@ -1193,18 +1346,26 @@ def main():
             if not data_args.streaming
             else map_fn_train()
         )
+
     if training_args.do_eval:
         for eval_split in all_eval_splits:
             raw_datasets_eval_features = list(raw_datasets[eval_split].features.keys())
+            
             map_fn_eval = partial(
                 raw_datasets[eval_split].map, function=prepare_eval_dataset, remove_columns=raw_datasets_eval_features
             )
+            # TODO: 아래 조건문 아예 없애기
             if accelerator.is_main_process:
                 vectorized_datasets[eval_split] = (
                     map_fn_eval(num_proc=num_workers, desc="preprocess eval dataset")
                     if not data_args.streaming
                     else map_fn_eval()
                 )
+            # vectorized_datasets[eval_split] = (
+            #     map_fn_eval(num_proc=num_workers, desc="preprocess eval dataset")
+            #     if not data_args.streaming
+            #     else map_fn_eval()
+            # )
 
     # 10.5: Filter training data with inputs longer than `max_input_length`
     def is_audio_in_length_range(length):
@@ -1261,8 +1422,9 @@ def main():
         wer_ortho = 100 * metric.compute(predictions=pred_str, references=label_str)
 
         # normalize everything and re-compute the WER
-        norm_pred_str = [normalizer(pred) for pred in pred_str]
-        norm_label_str = [normalizer(label) for label in label_str]
+        # normalize 후 strip
+        norm_pred_str = [normalizer(pred).strip() for pred in pred_str]
+        norm_label_str = [normalizer(label).strip() for label in label_str]
         # for logging, we need the pred/labels to match the norm_pred/norm_labels, so discard any filtered samples here
         pred_str = [pred_str[i] for i in range(len(norm_pred_str)) if len(norm_label_str[i]) > 0]
         label_str = [label_str[i] for i in range(len(norm_label_str)) if len(norm_label_str[i]) > 0]
@@ -1579,7 +1741,6 @@ def main():
                         eval_preds = []
                         eval_labels = []
                         eval_start = time.time()
-
                         validation_dataloader = DataLoader(
                             vectorized_datasets[eval_split],
                             collate_fn=data_collator,
